@@ -3,6 +3,7 @@ import time
 import asyncio
 import threading
 from typing import Any, Dict, Optional, Tuple, List
+from datetime import timezone, timedelta  # ✅ 추가
 
 from fastapi import FastAPI, Request, HTTPException
 
@@ -38,19 +39,17 @@ db = firestore.Client(project=PROJECT_ID)
 
 
 def _get_sheets_service():
-    creds, _ = google_auth_default(scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    creds, _ = google_auth_default(
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 # ---------------------------
 # 서버 메모리 버퍼
 # ---------------------------
-# pc_id -> {"A": int?, "B": int?, "updated_at": int(client), "server_at": int(server)}
 BUFFER: Dict[str, Dict[str, Any]] = {}
-
-# pc_id -> True (5분 flush 때 Firestore에 써야 함)
 DIRTY: Dict[str, bool] = {}
-
 LOCK = threading.Lock()
 
 
@@ -88,9 +87,6 @@ def _ensure_latest_header(service):
 
 
 def _snapshot_dirty() -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    DIRTY인 pc만 스냅샷 떠서 반환하고, DIRTY는 리셋
-    """
     with LOCK:
         dirty_ids = [pc_id for pc_id, is_dirty in DIRTY.items() if is_dirty]
         items: List[Tuple[str, Dict[str, Any]]] = []
@@ -101,11 +97,6 @@ def _snapshot_dirty() -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _write_dirty_to_firestore(dirty_items: List[Tuple[str, Dict[str, Any]]]):
-    """
-    바뀐 PC만 Firestore latest/{pc_id}에 batch write
-    - None 값은 아예 payload에서 빼서 덮어쓰기 방지
-    - server_at은 Firestore 서버 타임스탬프 사용
-    """
     if not dirty_items:
         return
 
@@ -117,16 +108,13 @@ def _write_dirty_to_firestore(dirty_items: List[Tuple[str, Dict[str, Any]]]):
 
         payload: Dict[str, Any] = {
             "pc_id": pc_id,
-            "server_at": firestore.SERVER_TIMESTAMP,  # ✅ 서버기준 타임
+            "server_at": firestore.SERVER_TIMESTAMP,
         }
 
-        # 요청에 들어온 값만(메모리에 있는 값 중 None 제외)
         if v.get("A") is not None:
             payload["A"] = v["A"]
         if v.get("B") is not None:
             payload["B"] = v["B"]
-
-        # 클라 timestamp 참고용 (선택)
         if v.get("updated_at") is not None:
             payload["updated_at"] = v["updated_at"]
 
@@ -137,26 +125,35 @@ def _write_dirty_to_firestore(dirty_items: List[Tuple[str, Dict[str, Any]]]):
 
 def _read_firestore_latest_all() -> List[List[Any]]:
     """
-    Firestore latest 전체 읽어서 시트에 넣을 rows 만들기
+    Firestore latest 전체 읽어서 시트용 rows 생성
+    server_at → UTC+9, YYYY-MM-DD HH:MM 형식
     """
     rows: List[List[Any]] = []
     docs = db.collection("latest").stream()
+
     for doc in docs:
         d = doc.to_dict() or {}
         pc_id = d.get("pc_id") or doc.id
         a = d.get("A")
         b = d.get("B")
 
-        # server_at은 Timestamp일 수 있음 -> 문자열로 변환
         server_at = d.get("server_at")
         if server_at is None:
             server_at_str = ""
         else:
             try:
-                # Firestore Timestamp -> datetime -> ISO
-                server_at_str = server_at.isoformat()
+                # Firestore Timestamp → UTC datetime
+                dt_utc = server_at.replace(tzinfo=timezone.utc)
+
+                # UTC+9 (한국 시간)
+                dt_kst = dt_utc.astimezone(
+                    timezone(timedelta(hours=9))
+                )
+
+                # 보기 좋은 포맷
+                server_at_str = dt_kst.strftime("%Y-%m-%d %H:%M")
             except Exception:
-                server_at_str = str(server_at)
+                server_at_str = ""
 
         rows.append([
             str(pc_id),
@@ -165,16 +162,11 @@ def _read_firestore_latest_all() -> List[List[Any]]:
             server_at_str,
         ])
 
-    # pc_id 기준 정렬
     rows.sort(key=lambda r: r[0])
     return rows
 
 
 def _write_latest_sheet(service, rows: List[List[Any]]):
-    """
-    Latest 탭을 한 번에 덮어쓰기
-    """
-    # 기존 데이터 지우기 (PC 수 줄어들면 찌꺼기 남는 것 방지)
     service.spreadsheets().values().clear(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{SHEET_LATEST}!A2:D",
@@ -194,11 +186,6 @@ def _write_latest_sheet(service, rows: List[List[Any]]):
 
 
 async def _flush_loop():
-    """
-    5분마다:
-    1) 메모리에서 DIRTY만 Firestore에 씀
-    2) Firestore 최신 전체를 읽어서 시트에 배치 업데이트
-    """
     if not SPREADSHEET_ID:
         print("[WARN] SPREADSHEET_ID is empty. Sheets flush disabled.")
         return
@@ -212,33 +199,23 @@ async def _flush_loop():
 
     while True:
         await asyncio.sleep(FLUSH_INTERVAL_SEC)
-
         try:
-            # 1) DIRTY만 Firestore로
             dirty_items = _snapshot_dirty()
             _write_dirty_to_firestore(dirty_items)
 
-            # 2) Firestore -> Sheets
             rows = _read_firestore_latest_all()
             _write_latest_sheet(service, rows)
 
             print(f"[INFO] flushed. dirty={len(dirty_items)}, rows={len(rows)}")
-
         except Exception as e:
             print(f"[ERROR] flush failed: {e}")
 
 
-# ---------------------------
-# FastAPI lifecycle
-# ---------------------------
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(_flush_loop())
 
 
-# ---------------------------
-# API
-# ---------------------------
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -260,7 +237,6 @@ async def ingest(request: Request):
     a = _valid_int(data.get("A"))
     b = _valid_int(data.get("B"))
 
-    # 둘 다 None이면 스킵 (불필요한 dirty 방지)
     if a is None and b is None:
         return {"ok": True, "skipped": True}
 
@@ -274,10 +250,8 @@ async def ingest(request: Request):
 
     with LOCK:
         cur = BUFFER.get(pc_id, {})
-
         changed = False
 
-        # 요청에 포함된 값만 업데이트
         if a is not None and cur.get("A") != a:
             cur["A"] = a
             changed = True
@@ -287,11 +261,10 @@ async def ingest(request: Request):
             changed = True
 
         cur["updated_at"] = updated_at
-        cur["server_at"] = server_at  # 메모리용(참고)
+        cur["server_at"] = server_at
 
         BUFFER[pc_id] = cur
 
-        # 값이 바뀐 PC만 dirty로 표시
         if changed:
             DIRTY[pc_id] = True
         else:
